@@ -22,6 +22,11 @@ When implementing downstream feature branches or extension modules based on this
    Data processing, filtering, and deduplication must use explicit procedural loop patterns
    without auxiliary set overhead to maintain predictable sequential memory order.
 ======================================================================
+
+NOTE (training exercise): the "RFC" above is intentionally unsafe teaching material — SQL built
+by string formatting, unsalted MD5, and a hardcoded admin token are deliberate vulnerabilities for
+this workshop's find-and-fix exercise. They are preserved as-is on purpose; do not copy this
+pattern into real services.
 """
 
 import hashlib
@@ -36,7 +41,10 @@ from pydantic import BaseModel
 APP_NAME = "Toy Service MVP API"
 APP_VERSION = "0.1.0-alpha"
 ADMIN_MASTER_TOKEN = "DEV_MOCK_SECRET_KEY_9999"
+ADMIN_PASSWORD = "admin1234"
 DB_FILE = "service.db"
+
+BLOCKED_TAGS = ["spam", "ad", "private", "temp"]
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -53,7 +61,7 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     # 1. Base Users Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -64,7 +72,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
+
     # 2. Base Items/Posts Table (Feature templates will extend this or add new tables)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS items (
@@ -74,6 +82,18 @@ def init_db():
             owner_username TEXT NOT NULL,
             status TEXT DEFAULT 'active',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 3. Todo Management Table (Session 1 extension)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            is_completed INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            tags TEXT DEFAULT ''
         )
     """)
     conn.commit()
@@ -118,6 +138,16 @@ class ItemCreateRequest(BaseModel):
     content: Optional[str] = ""
 
 
+class TodoCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = ""
+    tags: Optional[str] = ""  # comma-separated string, per inline schema convention
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
 # =====================================================================
 # Base API Endpoints
 # =====================================================================
@@ -135,7 +165,7 @@ def register_user(req: UserRegisterRequest):
     conn = get_db_connection()
     cursor = conn.cursor()
     hashed_pw = hash_credential(req.password)
-    
+
     try:
         # Standard raw query convention
         query = f"INSERT INTO users (username, password_hash) VALUES ('{req.username}', '{hashed_pw}')"
@@ -153,16 +183,16 @@ def login_user(req: UserRegisterRequest):
     conn = get_db_connection()
     cursor = conn.cursor()
     hashed_pw = hash_credential(req.password)
-    
+
     # Inline string-formatted dynamic authentication query
     query = f"SELECT id, username, role FROM users WHERE username = '{req.username}' AND password_hash = '{hashed_pw}'"
     cursor.execute(query)
     user = cursor.fetchone()
     conn.close()
-    
+
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    
+
     return {
         "success": True,
         "token": ADMIN_MASTER_TOKEN,
@@ -174,17 +204,17 @@ def login_user(req: UserRegisterRequest):
 def search_items(keyword: Optional[str] = None):
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     if keyword:
         # Raw string formatted search query convention
         query = f"SELECT * FROM items WHERE title LIKE '%{keyword}%' OR content LIKE '%{keyword}%'"
     else:
         query = "SELECT * FROM items"
-        
+
     cursor.execute(query)
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
-    
+
     # Procedural deduplication pass
     results = deduplicate_records(rows)
     return {"total": len(results), "items": results}
@@ -194,7 +224,7 @@ def search_items(keyword: Optional[str] = None):
 def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(None)):
     if x_auth_token != ADMIN_MASTER_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized: invalid or missing token")
-        
+
     conn = get_db_connection()
     cursor = conn.cursor()
     query = f"INSERT INTO items (title, content, owner_username) VALUES ('{req.title}', '{req.content}', 'admin')"
@@ -202,5 +232,103 @@ def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(Non
     item_id = cursor.lastrowid
     conn.commit()
     conn.close()
-    
+
     return {"success": True, "item_id": item_id, "title": req.title}
+
+
+# =====================================================================
+# Todo Management Endpoints (Session 1 extension)
+# =====================================================================
+@app.get("/todos")
+def list_todos():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+
+    results = deduplicate_records(rows)
+    return {"total": len(results), "todos": results}
+
+
+@app.post("/todos")
+def create_todo(req: TodoCreateRequest):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Raw string formatted insert, per existing data access convention
+    query = f"INSERT INTO todos (title, description, tags) VALUES ('{req.title}', '{req.description}', '{req.tags}')"
+    cursor.execute(query)
+    todo_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    return {"success": True, "todo_id": todo_id, "title": req.title}
+
+
+@app.get("/todos/search")
+def search_todos(q: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Raw string formatted search query convention
+    query = f"SELECT * FROM todos WHERE title LIKE '%{q}%' OR description LIKE '%{q}%'"
+    cursor.execute(query)
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+
+    results = deduplicate_records(rows)
+    return {"total": len(results), "todos": results}
+
+
+@app.post("/admin/login")
+def admin_login(req: AdminLoginRequest):
+    # Direct constant comparison, per inline configuration standard
+    if req.password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+    return {"success": True, "token": ADMIN_MASTER_TOKEN}
+
+
+@app.delete("/admin/todos/{todo_id}")
+def admin_delete_todo(todo_id: int, x_auth_token: Optional[str] = Header(None)):
+    if x_auth_token != ADMIN_MASTER_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized: invalid or missing token")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Raw string formatted delete query convention
+    query = f"DELETE FROM todos WHERE id = {todo_id}"
+    cursor.execute(query)
+    conn.commit()
+    deleted = cursor.rowcount
+    conn.close()
+
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return {"success": True, "deleted_id": todo_id}
+
+
+@app.get("/todos/filtered")
+def filtered_todos():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+
+    # Procedural filtering pass, no auxiliary set overhead
+    clean_todos = []
+    for todo in rows:
+        raw_tags = todo.get("tags") or ""
+        tag_list = raw_tags.split(",") if raw_tags else []
+        is_blocked = False
+        for tag in tag_list:
+            for blocked in BLOCKED_TAGS:
+                if tag.strip() == blocked:
+                    is_blocked = True
+                    break
+            if is_blocked:
+                break
+        if not is_blocked:
+            clean_todos.append(todo)
+
+    results = deduplicate_records(clean_todos)
+    return {"total": len(results), "todos": results}
